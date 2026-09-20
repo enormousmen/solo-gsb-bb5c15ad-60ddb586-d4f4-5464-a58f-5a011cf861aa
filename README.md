@@ -23,6 +23,12 @@ traffic 的 `Accept-Language` 流量样本与 1～12 个候选新增语言，穷
 （各自的 `supported_languages`、`default_language` 与可选 `locale_fallbacks`），
 逐样本复用单人协商并按「选中语言 + 是否默认兜底」比较，汇总总流量、结果变化流量、
 进入/离开兜底流量，并按首次出现顺序列出 before→after 转移桶及权重。
+`/api/v1/negotiate/config-probes` 提供**配置探针**：给定 2～8 组命名语言配置
+（各自的 `supported_languages`、`default_language` 与可选 `locale_fallbacks`）与
+1～20 个候选 `Accept-Language` 头，逐候选 × 逐配置复用单人协商，只有结果不同的
+候选才能区分一对配置；服务端用精确搜索选出能覆盖全部可区分配置对的**最少候选**
+（同数按候选下标序列字典序决胜），返回每项探针新覆盖的配置对，以及结果签名完全
+相同、任何候选都无法区分的配置组。
 
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · Uvicorn，依赖在容器构建时安装。
 
@@ -43,6 +49,7 @@ docker compose up -d --build
 | http://localhost:8000/api/v1/negotiate/group | 群体语言协商接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/coverage-plan | 候选语言覆盖规划接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/change-impact | 语言配置变更影响评估接口（`POST`） |
+| http://localhost:8000/api/v1/negotiate/config-probes | 配置探针接口（`POST`） |
 | http://localhost:8000/docs | Swagger UI 交互式文档 |
 | http://localhost:8000/openapi.json | OpenAPI 3 描述 |
 
@@ -654,6 +661,94 @@ curl -X POST http://localhost:8000/api/v1/negotiate/change-impact \
 `supported_languages`、`default_language`、`locale_fallbacks` 校验与单人接口
 完全一致，错误定位到对应配置内（如 `["body","after","locale_fallbacks"]`）。
 
+## 配置探针（POST /api/v1/negotiate/config-probes）
+
+当线上同时存在多套语言配置（灰度、多租户、版本演进），需要回答「**最少用哪几个
+`Accept-Language` 头就能把任意两套配置区分开？**」时，使用配置探针接口。请求给出
+2～8 组命名配置（每组字段与校验规则和单人接口的服务端配置完全一致，外加请求内唯一
+的 `name`）与 1～20 个候选 `Accept-Language` 头。服务端**逐候选 × 逐配置复用单人
+协商**，只比较 `(selected_language, fallback)` 二元组：只有结果不同的候选才能区分
+一对配置。随后用**精确搜索**（集合覆盖）选出能覆盖全部可区分配置对的**最少候选**，
+同数时按候选下标序列字典序决胜。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/negotiate/config-probes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "configs": [
+      {"name": "current",   "supported_languages": ["en-US", "zh-CN"], "default_language": "en-US"},
+      {"name": "plus-fr",   "supported_languages": ["en-US", "zh-CN", "fr-FR"], "default_language": "en-US"},
+      {"name": "plus-fr-de","supported_languages": ["en-US", "zh-CN", "fr-FR", "de-DE"], "default_language": "en-US"}
+    ],
+    "candidates": [
+      {"accept_language": "fr-FR,fr;q=0.9"},
+      {"accept_language": "de;q=0.8,fr;q=0.7"},
+      {"accept_language": "it"}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{
+  "probes": [
+    {
+      "candidate_index": 1,
+      "accept_language": "de;q=0.8,fr;q=0.7",
+      "newly_covered_pairs": [
+        {"first": "current", "second": "plus-fr"},
+        {"first": "current", "second": "plus-fr-de"},
+        {"first": "plus-fr", "second": "plus-fr-de"}
+      ]
+    }
+  ],
+  "distinguishable_pair_count": 3,
+  "indistinguishable_groups": [],
+  "message": "共 3 对可区分配置，精确搜索选出 1 个探针即可全部区分（探针数最少，同数按候选下标序列字典序决胜）；任意两配置均可被候选区分"
+}
+```
+
+上例中候选 1 一个头就能区分全部三对配置（`current` 兜底、`plus-fr` 命中 `fr-FR`、
+`plus-fr-de` 命中 `de-DE`），因此它是最少探针方案；候选 0 只能区分其中两对，
+候选 2 一对也区分不了，均未入选。
+
+### 配置探针请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `configs` | object[] | 是 | 2～8 组命名配置；`name` 非空且请求内不可重复（精确匹配，区分大小写） |
+| `configs[].name` | string | 是 | 配置名称，用于配置对与不可区分组的引用 |
+| `configs[].supported_languages` | string[] | 是 | 与单人接口相同（顺序即稳定优先级） |
+| `configs[].default_language` | string | 是 | 与单人接口相同（必须在该配置的支持列表中） |
+| `configs[].locale_fallbacks` | object<string,string> \| null | 否 | 与单人接口相同，按配置各自校验 |
+| `candidates` | object[] | 是 | 1～20 个候选头；`accept_language` 可缺省/`null`（视为无有效范围，恒走默认兜底） |
+
+### 探针规则与响应字段
+
+1. **结果矩阵**：每个候选头在每套配置下按单人接口语义（含通配符、逐级截断、
+   `q=0` 排除与各自的 `locale_fallbacks` 链）协商一次，只取
+   `(selected_language, fallback)` 二元组参与比较。
+2. **可区分配置对**：某对配置在某个候选下二元组不同，则该候选*覆盖*此配置对；
+   `distinguishable_pair_count` 为至少能被一个候选覆盖的配置对总数。
+3. **精确搜索**：把每个候选覆盖的配置对编成位掩码，按子集大小升序穷举候选组合，
+   首个并集覆盖全部可区分配置对的组合即答案——探针数最少，同数时候选下标序列
+   字典序最小（`probes` 按下标升序返回）。
+4. **新增覆盖**：`newly_covered_pairs` 只计入该探针**新**覆盖的配置对——已被
+   此前探针覆盖的对归此前探针；各探针的新增对合起来恰好是全部可区分配置对。
+5. **不可区分组**：`indistinguishable_groups` 列出结果签名（全部候选下的二元组
+   序列）完全相同的配置组（至少 2 个成员，按组内首个配置的输入顺序），组内配置
+   用这些候选**永远无法**区分；`signature` 给出该组逐候选的结果序列。
+6. **全同配置**：没有任何可区分配置对时 `probes` 为空数组，所有配置落入不可
+   区分组。
+
+校验（均返回 **HTTP 422**）：`configs` 少于 2 组或多于 8 组、配置名重复
+（`loc` 为 `["body","configs"]`）、`candidates` 为空或超过 20 个、某候选头语法
+非法（`loc` 形如 `["body","candidates",1,"accept_language"]`，`type` 为
+`accept_language.syntax_error`）；每组配置内部的 `supported_languages`、
+`default_language`、`locale_fallbacks` 校验与单人接口完全一致，错误定位到对应
+配置元素内（如 `["body","configs",0,"locale_fallbacks"]`）。
+
 ## 协商规则
 
 1. **q 权重**：遵循 RFC 9110，缺省 `q=1`；合法写法为 `0`–`1`、最多 3 位小数
@@ -741,7 +836,7 @@ docker run --rm -p 8000:8000 -e UVICORN_WORKERS=2 language-negotiator
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest -q          # 189 个单元/接口测试
+pytest -q          # 206 个单元/接口测试
 ```
 
 ## 项目结构

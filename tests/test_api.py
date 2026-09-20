@@ -1246,3 +1246,280 @@ def test_change_impact_extra_field_rejected_422():
     payload = _change_impact_payload()
     payload["before"]["unexpected"] = 1
     assert _post_change_impact(payload).status_code == 422
+
+
+def _post_config_probes(payload):
+    return client.post("/api/v1/negotiate/config-probes", json=payload)
+
+
+def _probe_config(name, supported, default, fallbacks=None):
+    config = {
+        "name": name,
+        "supported_languages": supported,
+        "default_language": default,
+    }
+    if fallbacks is not None:
+        config["locale_fallbacks"] = fallbacks
+    return config
+
+
+def test_config_probes_minimum_cover_and_lexicographic_tiebreak():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("base", ["en-US"], "en-US"),
+                _probe_config("fr", ["en-US", "fr-FR"], "en-US"),
+                _probe_config("de", ["en-US", "de-DE"], "en-US"),
+                _probe_config("fr-de", ["en-US", "fr-FR", "de-DE"], "en-US"),
+            ],
+            "candidates": [
+                {"accept_language": "fr"},
+                {"accept_language": "de"},
+                {"accept_language": "fr,de"},
+            ],
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["distinguishable_pair_count"] == 6
+    # No single candidate covers all six pairs; (0, 1) and (1, 2) both
+    # do, and the lexicographically smaller index sequence wins.
+    assert [p["candidate_index"] for p in body["probes"]] == [0, 1]
+    first, second = body["probes"]
+    assert first["accept_language"] == "fr"
+    assert first["newly_covered_pairs"] == [
+        {"first": "base", "second": "fr"},
+        {"first": "base", "second": "fr-de"},
+        {"first": "fr", "second": "de"},
+        {"first": "de", "second": "fr-de"},
+    ]
+    # Pairs already covered by probe 0 are attributed to probe 0.
+    assert second["newly_covered_pairs"] == [
+        {"first": "base", "second": "de"},
+        {"first": "fr", "second": "fr-de"},
+    ]
+    assert body["indistinguishable_groups"] == []
+
+
+def test_config_probes_indistinguishable_groups():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("v1", ["en-US", "zh-CN"], "en-US"),
+                _probe_config("v1-copy", ["en-US", "zh-CN"], "en-US"),
+                _probe_config("v2", ["en-US", "zh-CN", "fr-FR"], "en-US"),
+                _probe_config("v2-copy", ["en-US", "zh-CN", "fr-FR"], "en-US"),
+            ],
+            "candidates": [
+                {"accept_language": "fr"},
+                {"accept_language": "zh"},
+            ],
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["distinguishable_pair_count"] == 4
+    # The "zh" candidate distinguishes nothing and is never a probe.
+    assert [p["candidate_index"] for p in body["probes"]] == [0]
+    assert body["probes"][0]["newly_covered_pairs"] == [
+        {"first": "v1", "second": "v2"},
+        {"first": "v1", "second": "v2-copy"},
+        {"first": "v1-copy", "second": "v2"},
+        {"first": "v1-copy", "second": "v2-copy"},
+    ]
+    groups = body["indistinguishable_groups"]
+    assert [g["configs"] for g in groups] == [
+        ["v1", "v1-copy"],
+        ["v2", "v2-copy"],
+    ]
+    assert groups[0]["signature"] == [
+        {"selected_language": "en-US", "fallback": True},
+        {"selected_language": "zh-CN", "fallback": False},
+    ]
+    assert groups[1]["signature"] == [
+        {"selected_language": "fr-FR", "fallback": False},
+        {"selected_language": "zh-CN", "fallback": False},
+    ]
+
+
+def test_config_probes_all_identical_no_probes():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("a", ["en-US"], "en-US"),
+                _probe_config("b", ["en-US"], "en-US"),
+            ],
+            "candidates": [{"accept_language": "fr"}],
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["probes"] == []
+    assert body["distinguishable_pair_count"] == 0
+    assert [g["configs"] for g in body["indistinguishable_groups"]] == [["a", "b"]]
+
+
+def test_config_probes_absent_header_distinguishes_defaults():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("en-default", ["en-US", "zh-CN"], "en-US"),
+                _probe_config("zh-default", ["en-US", "zh-CN"], "zh-CN"),
+            ],
+            "candidates": [{}],
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    # A missing header always falls back to the default language, so it
+    # still distinguishes configs with different defaults.
+    assert body["probes"] == [
+        {
+            "candidate_index": 0,
+            "accept_language": None,
+            "newly_covered_pairs": [
+                {"first": "en-default", "second": "zh-default"}
+            ],
+        }
+    ]
+    assert body["indistinguishable_groups"] == []
+
+
+def test_config_probes_locale_fallbacks_change_outcomes():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("plain", ["en-US", "zh-TW"], "en-US"),
+                _probe_config(
+                    "chained", ["en-US", "zh-TW"], "en-US", {"gsw": "zh-TW"}
+                ),
+            ],
+            "candidates": [{"accept_language": "gsw"}],
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert [p["candidate_index"] for p in body["probes"]] == [0]
+    assert body["probes"][0]["newly_covered_pairs"] == [
+        {"first": "plain", "second": "chained"}
+    ]
+
+
+def test_config_probes_invalid_candidate_header_422():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("a", ["en-US"], "en-US"),
+                _probe_config("b", ["en-US", "fr-FR"], "en-US"),
+            ],
+            "candidates": [
+                {"accept_language": "en"},
+                {"accept_language": "fr;q=2"},
+            ],
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "candidates", 1, "accept_language"]
+    assert detail[0]["type"] == "accept_language.syntax_error"
+
+
+def test_config_probes_duplicate_config_name_422():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("a", ["en-US"], "en-US"),
+                _probe_config("a", ["en-US", "fr-FR"], "en-US"),
+            ],
+            "candidates": [{"accept_language": "en"}],
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "configs"]
+    assert "重复" in detail[0]["msg"]
+
+
+def test_config_probes_config_count_bounds_422():
+    candidates = [{"accept_language": "en"}]
+    one = [_probe_config("a", ["en-US"], "en-US")]
+    nine = [_probe_config(f"c{i}", ["en-US"], "en-US") for i in range(9)]
+    for configs in (one, nine):
+        response = _post_config_probes(
+            {"configs": configs, "candidates": candidates}
+        )
+        assert response.status_code == 422
+
+
+def test_config_probes_candidate_count_bounds_422():
+    configs = [
+        _probe_config("a", ["en-US"], "en-US"),
+        _probe_config("b", ["en-US", "fr-FR"], "en-US"),
+    ]
+    assert (
+        _post_config_probes({"configs": configs, "candidates": []}).status_code
+        == 422
+    )
+    many = [{"accept_language": "en"} for _ in range(21)]
+    assert (
+        _post_config_probes({"configs": configs, "candidates": many}).status_code
+        == 422
+    )
+
+
+def test_config_probes_nested_config_validation_422():
+    # default_language not in the config's own supported_languages.
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("a", ["en-US"], "fr-FR"),
+                _probe_config("b", ["en-US"], "en-US"),
+            ],
+            "candidates": [{"accept_language": "en"}],
+        }
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][:2] == ["body", "configs"]
+
+    # Dangling locale_fallbacks chain, located inside the config element.
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("a", ["en-US"], "en-US", {"de": "xx"}),
+                _probe_config("b", ["en-US"], "en-US"),
+            ],
+            "candidates": [{"accept_language": "en"}],
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "configs", 0, "locale_fallbacks"]
+    assert "悬空" in detail[0]["msg"]
+
+
+def test_config_probes_extra_field_rejected_422():
+    configs = [
+        _probe_config("a", ["en-US"], "en-US"),
+        _probe_config("b", ["en-US", "fr-FR"], "en-US"),
+    ]
+    payload = {
+        "configs": configs,
+        "candidates": [{"accept_language": "en"}],
+        "unexpected": 1,
+    }
+    assert _post_config_probes(payload).status_code == 422
+
+    payload = {
+        "configs": configs,
+        "candidates": [{"accept_language": "en", "unexpected": 1}],
+    }
+    assert _post_config_probes(payload).status_code == 422
+
+    payload = {
+        "configs": [
+            {**_probe_config("a", ["en-US"], "en-US"), "unexpected": 1},
+            _probe_config("b", ["en-US"], "en-US"),
+        ],
+        "candidates": [{"accept_language": "en"}],
+    }
+    assert _post_config_probes(payload).status_code == 422

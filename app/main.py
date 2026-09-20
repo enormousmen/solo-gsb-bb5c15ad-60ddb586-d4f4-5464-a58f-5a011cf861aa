@@ -10,18 +10,22 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .negotiation import (
     AcceptLanguageError,
+    CandidateHeaderError,
     ParticipantHeaderError,
     SampleHeaderError,
     analyze_q_stability,
     assess_change_impact,
     negotiate,
     negotiate_group,
+    plan_config_probes,
     plan_coverage,
     steer_q,
 )
 from .schemas import (
     ChangeImpactRequest,
     ChangeImpactResponse,
+    ConfigProbesRequest,
+    ConfigProbesResponse,
     CoveragePlanRequest,
     CoveragePlanResponse,
     GroupNegotiationRequest,
@@ -50,6 +54,11 @@ app = FastAPI(
         "（各自的 supported_languages、default_language 与可选 locale_fallbacks）"
         "下（选中语言, 是否默认兜底）的变化，汇总总流量、变化流量、进入/离开兜底"
         "流量，并按首次出现顺序列出 before→after 转移桶及权重。"
+        "另提供 /api/v1/negotiate/config-probes 配置探针：对 2～8 组命名语言配置"
+        "与 1～20 个候选 Accept-Language 头逐一复用单人协商，只有结果不同的候选"
+        "才能区分一对配置；精确搜索选出覆盖全部可区分配置对的最少候选（同数按"
+        "候选下标序列字典序决胜），并报告每项探针新覆盖的配置对与结果签名完全"
+        "相同、任何候选都无法区分的配置组。"
     ),
     version=__version__,
 )
@@ -131,6 +140,31 @@ async def participant_header_error_handler(
                     "loc": [
                         "body",
                         "participants",
+                        exc.position - 1,
+                        "accept_language",
+                    ],
+                    "msg": str(exc),
+                    "type": "accept_language.syntax_error",
+                }
+            ]
+        },
+    )
+
+
+@app.exception_handler(CandidateHeaderError)
+async def candidate_header_error_handler(
+    request: Request, exc: CandidateHeaderError
+) -> JSONResponse:
+    # Same 422 envelope shape, but located at the offending candidate's
+    # array element (FastAPI loc paths use 0-based array indices).
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": [
+                {
+                    "loc": [
+                        "body",
+                        "candidates",
                         exc.position - 1,
                         "accept_language",
                     ],
@@ -289,6 +323,30 @@ async def negotiate_change_impact(
     return ChangeImpactResponse.model_validate(result)
 
 
+@app.post(
+    "/api/v1/negotiate/config-probes",
+    response_model=ConfigProbesResponse,
+    tags=["语言协商"],
+    summary="配置探针：区分多套语言配置的最少候选头",
+)
+async def negotiate_config_probes(
+    payload: ConfigProbesRequest,
+) -> ConfigProbesResponse:
+    result = plan_config_probes(
+        configs=[
+            (
+                config.name,
+                config.supported_languages,
+                config.default_language,
+                config.locale_fallbacks,
+            )
+            for config in payload.configs
+        ],
+        candidates=[candidate.accept_language for candidate in payload.candidates],
+    )
+    return ConfigProbesResponse.model_validate(result)
+
+
 @app.get("/", tags=["元信息"])
 async def root() -> dict[str, str]:
     return {
@@ -301,4 +359,5 @@ async def root() -> dict[str, str]:
         "negotiate_q_steer": "POST /api/v1/negotiate/q-steer",
         "negotiate_group": "POST /api/v1/negotiate/group",
         "negotiate_change_impact": "POST /api/v1/negotiate/change-impact",
+        "negotiate_config_probes": "POST /api/v1/negotiate/config-probes",
     }

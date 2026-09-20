@@ -52,6 +52,16 @@ Implements the negotiation rules required by the service:
   changed, fallback-entered and fallback-exited traffic, plus the
   before->after transition buckets with their weights in
   first-appearance order.
+* :func:`plan_config_probes` reuses :func:`negotiate` to compare 2-8
+  named language configurations: every candidate Accept-Language header
+  is negotiated under every config, and a candidate *distinguishes* a
+  config pair when its (selected_language, fallback) outcomes differ
+  between the two configs. An exact search over the candidates'
+  distinguishable-pair bitmasks finds the minimum set of probes whose
+  union covers every distinguishable pair, ties broken by the
+  lexicographic candidate-index sequence; configs whose outcome
+  signatures are identical across every candidate are reported as
+  indistinguishable groups.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
 covers every ordinary language tag (the legacy "grandfathered" irregular
@@ -121,6 +131,21 @@ class SampleHeaderError(AcceptLanguageError):
         self.position = position
         super().__init__(
             f"第 {position} 个样本的 Accept-Language 非法: {detail}"
+        )
+
+
+class CandidateHeaderError(AcceptLanguageError):
+    """A config-probe candidate's Accept-Language header failed to parse.
+
+    Carries the 1-based ``position`` of the offending candidate so the
+    API layer can point the 422 response at the exact ``candidates``
+    array element.
+    """
+
+    def __init__(self, position: int, detail: str):
+        self.position = position
+        super().__init__(
+            f"第 {position} 个候选的 Accept-Language 非法: {detail}"
         )
 
 
@@ -1386,4 +1411,168 @@ def steer_q(
             "new_q": best_step / Q_GRID_STEPS,
         },
         "ranges": None,
+    }
+
+
+def plan_config_probes(
+    configs: list[tuple[str, list[str], str, dict[str, str] | None]],
+    candidates: list[str | None],
+) -> dict[str, Any]:
+    """Select the fewest candidate headers that tell the configs apart.
+
+    ``configs`` is a list of ``(name, supported_languages,
+    default_language, locale_fallbacks)`` tuples (2-8 entries; the
+    request schema enforces unique names and per-config validation);
+    ``candidates`` is a list of raw Accept-Language header values
+    (1-20 entries, ``None``/blank allowed). Every candidate is
+    negotiated under every config with the exact semantics of
+    :func:`negotiate`, and the outcomes are compared by the
+    ``(selected_language, fallback)`` pair only.
+
+    A candidate *distinguishes* a config pair when its outcomes under
+    the two configs differ. The exact search treats each candidate's
+    distinguishable-pair set as a bitmask and finds the minimum-size
+    probe set whose union covers every distinguishable pair; ties are
+    broken by the lexicographic candidate-index sequence (the first
+    covering combination of the smallest size, enumerated in ascending
+    index order). Candidates that can never belong to that optimal
+    set -- empty masks, and masks subsumed by an earlier candidate's
+    mask -- are skipped without changing the result.
+
+    The report lists the chosen probes in candidate order, each with
+    the config pairs it *newly* covers (pairs already covered by an
+    earlier probe are attributed to that earlier probe), plus the
+    groups of configs whose outcome signatures -- the
+    ``(selected_language, fallback)`` sequence across all candidates --
+    are completely identical and therefore indistinguishable by any
+    candidate. A malformed candidate header raises
+    :class:`CandidateHeaderError` with the 1-based candidate position.
+    """
+
+    for position, header in enumerate(candidates, start=1):
+        try:
+            parse_accept_language(header)
+        except AcceptLanguageError as exc:
+            raise CandidateHeaderError(position, str(exc)) from exc
+
+    # Outcome matrix: outcomes[candidate][config] = (selected, fallback).
+    outcomes: list[list[tuple[str, bool]]] = []
+    for header in candidates:
+        row: list[tuple[str, bool]] = []
+        for _name, supported, default, locale_fallbacks in configs:
+            result = negotiate(
+                header=header,
+                supported=supported,
+                default=default,
+                locale_fallbacks=locale_fallbacks,
+            )
+            row.append((result["selected_language"], result["fallback"]))
+        outcomes.append(row)
+
+    # One bit per unordered config pair (config input order); a
+    # candidate's mask marks the pairs its outcomes distinguish.
+    pairs = [
+        (first, second)
+        for first in range(len(configs))
+        for second in range(first + 1, len(configs))
+    ]
+    masks: list[int] = []
+    for row in outcomes:
+        mask = 0
+        for bit, (first, second) in enumerate(pairs):
+            if row[first] != row[second]:
+                mask |= 1 << bit
+        masks.append(mask)
+    full_mask = 0
+    for mask in masks:
+        full_mask |= mask
+
+    chosen: tuple[int, ...] = ()
+    if full_mask:
+        # Exact minimum set cover. The pruning keeps the result exact:
+        # an empty mask adds nothing to any cover, and a mask subsumed
+        # by an earlier candidate can always be swapped for that earlier
+        # candidate (same size, same coverage, lexicographically smaller
+        # index sequence), so neither can appear in the answer.
+        kept: list[int] = []
+        for index, mask in enumerate(masks):
+            if not mask:
+                continue
+            if any(masks[other] & mask == mask for other in kept):
+                continue
+            kept.append(index)
+        for size in range(1, len(kept) + 1):
+            # combinations() yields index tuples in lexicographic order,
+            # so the first covering combo of the smallest size is
+            # exactly the required answer.
+            for combo in combinations(kept, size):
+                union = 0
+                for index in combo:
+                    union |= masks[index]
+                if union == full_mask:
+                    chosen = combo
+                    break
+            if chosen:
+                break
+
+    probes: list[dict[str, Any]] = []
+    covered_mask = 0
+    for index in chosen:
+        new_bits = masks[index] & ~covered_mask
+        covered_mask |= masks[index]
+        probes.append(
+            {
+                "candidate_index": index,
+                "accept_language": candidates[index],
+                "newly_covered_pairs": [
+                    {"first": configs[first][0], "second": configs[second][0]}
+                    for bit, (first, second) in enumerate(pairs)
+                    if new_bits & (1 << bit)
+                ],
+            }
+        )
+
+    # Configs with identical outcome signatures across every candidate
+    # cannot be told apart by any probe; report the groups of 2+ in
+    # first-appearance order.
+    members_by_signature: dict[tuple[tuple[str, bool], ...], list[int]] = {}
+    for config_index in range(len(configs)):
+        signature = tuple(row[config_index] for row in outcomes)
+        members_by_signature.setdefault(signature, []).append(config_index)
+    groups = [
+        {
+            "configs": [configs[member][0] for member in members],
+            "signature": [
+                {"selected_language": selected, "fallback": fallback}
+                for selected, fallback in signature
+            ],
+        }
+        for signature, members in members_by_signature.items()
+        if len(members) > 1
+    ]
+
+    pair_count = bin(full_mask).count("1")
+    if not full_mask:
+        message = (
+            "全部配置在所有候选头下的协商结果完全一致，"
+            "没有可区分的配置对，探针列表为空"
+        )
+    elif groups:
+        message = (
+            f"共 {pair_count} 对可区分配置，精确搜索选出 {len(chosen)} 个探针"
+            "即可全部区分（探针数最少，同数按候选下标序列字典序决胜）；"
+            f"另有 {len(groups)} 组配置的结果签名完全相同，任何候选都无法区分"
+        )
+    else:
+        message = (
+            f"共 {pair_count} 对可区分配置，精确搜索选出 {len(chosen)} 个探针"
+            "即可全部区分（探针数最少，同数按候选下标序列字典序决胜）；"
+            "任意两配置均可被候选区分"
+        )
+
+    return {
+        "probes": probes,
+        "distinguishable_pair_count": pair_count,
+        "indistinguishable_groups": groups,
+        "message": message,
     }

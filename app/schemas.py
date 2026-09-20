@@ -660,6 +660,133 @@ class ChangeImpactResponse(BaseModel):
     )
 
 
+class ConfigProbeConfig(ChangeImpactConfig):
+    """One named language configuration compared by the config probes.
+
+    Inherits every field and validation rule of
+    :class:`ChangeImpactConfig` (supported list, default language and
+    optional locale_fallbacks chains) and adds a request-unique ``name``
+    used to reference the config in pairs and groups.
+    """
+
+    name: str = Field(
+        min_length=1,
+        title="配置名称",
+        description="请求内不可重复（精确匹配，区分大小写）",
+    )
+
+
+class ConfigProbeCandidate(BaseModel):
+    """One candidate Accept-Language header for config probing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accept_language: str | None = Field(
+        default=None,
+        title="候选 Accept-Language 头",
+        description="缺失/null/空白视为无有效范围（恒定走默认兜底）",
+    )
+
+
+class ConfigProbesRequest(BaseModel):
+    """Config-probe input: named configs plus candidate headers.
+
+    ``configs`` are 2-8 named language configurations to compare;
+    ``candidates`` are 1-20 candidate Accept-Language headers evaluated
+    under every config with the exact semantics of the single
+    negotiation endpoint.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    configs: list[ConfigProbeConfig] = Field(
+        min_length=2,
+        max_length=8,
+        title="参与比较的命名语言配置（2～8 组，名称不可重复）",
+    )
+    candidates: list[ConfigProbeCandidate] = Field(
+        min_length=1,
+        max_length=20,
+        title="候选 Accept-Language 头（1～20 个）",
+    )
+
+    @field_validator("configs")
+    @classmethod
+    def _validate_unique_names(
+        cls, value: list[ConfigProbeConfig]
+    ) -> list[ConfigProbeConfig]:
+        seen: set[str] = set()
+        for config in value:
+            if config.name in seen:
+                raise ValueError(f"configs 存在重复名称: {config.name!r}")
+            seen.add(config.name)
+        return value
+
+
+class ConfigProbePair(BaseModel):
+    """One distinguishable config pair, reported in config input order."""
+
+    first: str = Field(description="配置对中输入序较早的配置名")
+    second: str = Field(description="配置对中输入序较晚的配置名")
+
+
+class ConfigProbeOutcome(BaseModel):
+    """One (selected_language, fallback) outcome inside a result signature."""
+
+    selected_language: str = Field(description="该候选头下选中的语言")
+    fallback: bool = Field(description="该候选头下是否回退到默认语言")
+
+
+class ConfigProbe(BaseModel):
+    """One selected probe: a candidate header plus its newly covered pairs."""
+
+    candidate_index: int = Field(
+        description="候选头在 candidates 数组中的下标（从 0 开始）"
+    )
+    accept_language: str | None = Field(
+        description="该候选的原始 Accept-Language 头（回显）"
+    )
+    newly_covered_pairs: list[ConfigProbePair] = Field(
+        description=(
+            "该探针新覆盖的可区分配置对；已被此前探针覆盖的对归此前探针，"
+            "不再重复计入"
+        )
+    )
+
+
+class IndistinguishableConfigGroup(BaseModel):
+    """Configs whose result signatures are completely identical."""
+
+    configs: list[str] = Field(
+        description="结果签名完全相同的配置名（按配置输入顺序，至少 2 个）"
+    )
+    signature: list[ConfigProbeOutcome] = Field(
+        description=(
+            "该组配置在每个候选头下的 (selected_language, fallback) 结果序列"
+            "（按候选输入顺序）"
+        )
+    )
+
+
+class ConfigProbesResponse(BaseModel):
+    probes: list[ConfigProbe] = Field(
+        description=(
+            "精确搜索选出的最少探针（按候选下标升序）；其覆盖并集恒等于"
+            "全部可区分配置对"
+        )
+    )
+    distinguishable_pair_count: int = Field(
+        description="至少能被一个候选区分的配置对总数"
+    )
+    indistinguishable_groups: list[IndistinguishableConfigGroup] = Field(
+        description=(
+            "结果签名完全相同、任何候选都无法区分的配置组"
+            "（按组内首个配置的输入顺序）"
+        )
+    )
+    message: str
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     service: str

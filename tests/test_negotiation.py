@@ -4,6 +4,7 @@ import pytest
 
 from app.negotiation import (
     AcceptLanguageError,
+    CandidateHeaderError,
     LocaleFallbackError,
     ParticipantHeaderError,
     SampleHeaderError,
@@ -13,6 +14,7 @@ from app.negotiation import (
     negotiate_group,
     normalize_fallbacks,
     parse_accept_language,
+    plan_config_probes,
     plan_coverage,
     steer_q,
     truncation_chain,
@@ -1331,3 +1333,81 @@ class TestQSteer:
             self.DEFAULT,
             fallbacks,
         )
+
+
+class TestPlanConfigProbes:
+    def _configs(self):
+        return [
+            ("base", ["en-US"], "en-US", None),
+            ("fr", ["en-US", "fr-FR"], "en-US", None),
+            ("de", ["en-US", "de-DE"], "en-US", None),
+            ("fr-de", ["en-US", "fr-FR", "de-DE"], "en-US", None),
+        ]
+
+    def test_minimum_cover_and_lexicographic_tiebreak(self):
+        result = plan_config_probes(
+            self._configs(), ["fr", "de", "fr,de"]
+        )
+        assert result["distinguishable_pair_count"] == 6
+        # (0, 1) and (1, 2) both cover all six pairs; the
+        # lexicographically smaller index sequence wins.
+        assert [p["candidate_index"] for p in result["probes"]] == [0, 1]
+        assert result["probes"][0]["newly_covered_pairs"] == [
+            {"first": "base", "second": "fr"},
+            {"first": "base", "second": "fr-de"},
+            {"first": "fr", "second": "de"},
+            {"first": "de", "second": "fr-de"},
+        ]
+        assert result["probes"][1]["newly_covered_pairs"] == [
+            {"first": "base", "second": "de"},
+            {"first": "fr", "second": "fr-de"},
+        ]
+        assert result["indistinguishable_groups"] == []
+
+    def test_single_probe_covering_everything(self):
+        result = plan_config_probes(self._configs(), ["fr,de", "fr"])
+        # Candidate 0 alone covers every distinguishable pair; the "fr"
+        # and "fr-de" configs select fr-FR under both candidates, so
+        # they stay indistinguishable.
+        assert [p["candidate_index"] for p in result["probes"]] == [0]
+        assert result["distinguishable_pair_count"] == 5
+        assert [g["configs"] for g in result["indistinguishable_groups"]] == [
+            ["fr", "fr-de"]
+        ]
+
+    def test_duplicate_candidates_keep_earliest_index(self):
+        result = plan_config_probes(self._configs(), ["fr", "fr", "de"])
+        # The duplicate "fr" at index 1 is subsumed by index 0.
+        assert [p["candidate_index"] for p in result["probes"]] == [0, 2]
+
+    def test_indistinguishable_groups_and_signatures(self):
+        configs = [
+            ("v1", ["en-US", "zh-CN"], "en-US", None),
+            ("v1-copy", ["en-US", "zh-CN"], "en-US", None),
+            ("v2", ["en-US", "zh-CN", "fr-FR"], "en-US", None),
+        ]
+        result = plan_config_probes(configs, ["fr", "zh"])
+        assert [p["candidate_index"] for p in result["probes"]] == [0]
+        groups = result["indistinguishable_groups"]
+        assert [g["configs"] for g in groups] == [["v1", "v1-copy"]]
+        assert groups[0]["signature"] == [
+            {"selected_language": "en-US", "fallback": True},
+            {"selected_language": "zh-CN", "fallback": False},
+        ]
+
+    def test_all_identical_no_probes(self):
+        configs = [
+            ("a", ["en-US"], "en-US", None),
+            ("b", ["en-US"], "en-US", None),
+        ]
+        result = plan_config_probes(configs, ["fr", None])
+        assert result["probes"] == []
+        assert result["distinguishable_pair_count"] == 0
+        assert [g["configs"] for g in result["indistinguishable_groups"]] == [
+            ["a", "b"]
+        ]
+
+    def test_invalid_candidate_header_reports_position(self):
+        with pytest.raises(CandidateHeaderError) as excinfo:
+            plan_config_probes(self._configs(), ["en", "fr;q=2"])
+        assert excinfo.value.position == 2
