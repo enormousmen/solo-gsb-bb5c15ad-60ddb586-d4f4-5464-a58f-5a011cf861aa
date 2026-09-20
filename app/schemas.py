@@ -660,6 +660,145 @@ class ChangeImpactResponse(BaseModel):
     )
 
 
+class ProbeConfig(ChangeImpactConfig):
+    """One named language configuration for config-probe planning.
+
+    Inherits every field and validation rule of
+    :class:`ChangeImpactConfig` (supported list with stable order,
+    default language contained in it, optional locale_fallbacks chains)
+    and adds the request-unique ``name`` used to identify the
+    configuration in the response.
+    """
+
+    name: str = Field(
+        min_length=1,
+        title="配置名称",
+        description="请求内不可重复（精确匹配，区分大小写）",
+    )
+
+
+class ConfigProbeRequest(BaseModel):
+    """Config-probe planning input.
+
+    ``configs`` are 2-8 named language configurations evaluated with the
+    exact semantics of the single negotiation endpoint; ``candidates``
+    are 1-20 raw candidate Accept-Language headers (``null``/blank means
+    no valid range, duplicate headers are allowed) used as probes to
+    separate the configurations.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    configs: list[ProbeConfig] = Field(
+        min_length=2,
+        max_length=8,
+        title="命名语言配置（2～8 套，名称不可重复）",
+    )
+    candidates: list[str | None] = Field(
+        min_length=1,
+        max_length=20,
+        title="候选 Accept-Language 头（1～20 个）",
+        description=(
+            "null/缺失或空白串视为无有效范围；允许重复。任一候选头语法非法时 "
+            "返回 422 并定位到该数组下标。"
+        ),
+    )
+
+    @field_validator("configs")
+    @classmethod
+    def _validate_unique_names(cls, value: list[ProbeConfig]) -> list[ProbeConfig]:
+        seen: set[str] = set()
+        for config in value:
+            if config.name in seen:
+                raise ValueError(f"configs 存在重复配置名: {config.name!r}")
+            seen.add(config.name)
+        return value
+
+
+class ProbeResult(BaseModel):
+    """One configuration's (selected_language, fallback) under a probe."""
+
+    config: str = Field(description="配置名称")
+    selected_language: str = Field(description="该探针在此配置下选中的语言")
+    fallback: bool = Field(description="该探针在此配置下是否回退到默认语言")
+
+
+class ProbeNewlyCoveredPair(BaseModel):
+    """A configuration pair first distinguished by this probe."""
+
+    configs: list[str] = Field(
+        description="被该探针首次区分的一对配置名（按 configs 输入顺序）"
+    )
+    results: list[ProbeResult] = Field(
+        description="该探针在这两套配置下各自的（选中语言, 是否兜底）结果"
+    )
+
+
+class ConfigProbeEntry(BaseModel):
+    candidate_index: int = Field(
+        description="入选探针在 candidates 数组中的下标（从 0 开始）"
+    )
+    accept_language: str | None = Field(description="候选 Accept-Language 头原文")
+    results: list[ProbeResult] = Field(
+        description="该探针在每一套配置下的 selected_language 与 fallback"
+    )
+    newly_covered_pairs: list[ProbeNewlyCoveredPair] = Field(
+        description=(
+            "相对于更早的入选探针，该探针新增覆盖（首次区分）的配置对；"
+            "各探针新增对之和恒等于全部可区分配置对"
+        )
+    )
+
+
+class IndistinguishableSignatureEntry(BaseModel):
+    """One candidate's shared result inside an indistinguishable group."""
+
+    candidate_index: int = Field(
+        description="候选 Accept-Language 头在 candidates 数组中的下标（从 0 开始）"
+    )
+    accept_language: str | None = Field(description="候选 Accept-Language 头原文")
+    selected_language: str = Field(
+        description="组内每套配置在该候选下共同选中的语言"
+    )
+    fallback: bool = Field(
+        description="组内每套配置在该候选下共同的默认兜底标记"
+    )
+
+
+class IndistinguishableGroup(BaseModel):
+    """Configurations with identical result signatures across all candidates."""
+
+    configs: list[str] = Field(
+        description="在所有候选 Accept-Language 头下结果都相同的配置名（按输入顺序）"
+    )
+    signature: list[IndistinguishableSignatureEntry] = Field(
+        description=(
+            "组内配置共享的结果签名：每个候选 Accept-Language 头对应的"
+            " selected_language 与 fallback（按 candidates 下标顺序）"
+        )
+    )
+
+
+class ConfigProbeResponse(BaseModel):
+    probes: list[ConfigProbeEntry] = Field(
+        description=(
+            "覆盖全部可区分配置对所需的最少候选；按入选（候选下标升序）顺序，"
+            "每项给出该候选在各配置下的结果与其新增覆盖的配置对"
+        )
+    )
+    total_pair_count: int = Field(description="配置对总数（C(configs, 2)）")
+    distinguishable_pair_count: int = Field(
+        description="至少有一个候选能区分的配置对数量"
+    )
+    indistinguishable_groups: list[IndistinguishableGroup] = Field(
+        description=(
+            "在全部候选 Accept-Language 头下结果签名完全相同而无法区分的配置组"
+            "（仅含 2 套及以上配置的组，按首个成员的输入顺序）"
+        )
+    )
+    message: str
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     service: str

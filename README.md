@@ -23,6 +23,12 @@ traffic 的 `Accept-Language` 流量样本与 1～12 个候选新增语言，穷
 （各自的 `supported_languages`、`default_language` 与可选 `locale_fallbacks`），
 逐样本复用单人协商并按「选中语言 + 是否默认兜底」比较，汇总总流量、结果变化流量、
 进入/离开兜底流量，并按首次出现顺序列出 before→after 转移桶及权重。
+`/api/v1/negotiate/config-probes` 提供**配置探针规划**：给定 2～8 套**命名**语言
+配置与 1～20 个候选 `Accept-Language` 头，对每个候选 × 每套配置复用单人协商求
+`selected_language` 与 `fallback`；只有某候选在两套配置下结果不同时，该候选才能
+**区分**这对配置。服务端穷举选出能覆盖全部可区分配置对的**最少候选**（同数按候选
+下标序列字典序决胜），返回每个探针在各配置下的结果与它新增覆盖的配置对，以及在
+所有候选头下结果签名完全相同、因而无法区分的配置组。
 
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · Uvicorn，依赖在容器构建时安装。
 
@@ -43,6 +49,7 @@ docker compose up -d --build
 | http://localhost:8000/api/v1/negotiate/group | 群体语言协商接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/coverage-plan | 候选语言覆盖规划接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/change-impact | 语言配置变更影响评估接口（`POST`） |
+| http://localhost:8000/api/v1/negotiate/config-probes | 多套语言配置的最少区分探针规划接口（`POST`） |
 | http://localhost:8000/docs | Swagger UI 交互式文档 |
 | http://localhost:8000/openapi.json | OpenAPI 3 描述 |
 
@@ -654,6 +661,141 @@ curl -X POST http://localhost:8000/api/v1/negotiate/change-impact \
 `supported_languages`、`default_language`、`locale_fallbacks` 校验与单人接口
 完全一致，错误定位到对应配置内（如 `["body","after","locale_fallbacks"]`）。
 
+## 配置探针规划（POST /api/v1/negotiate/config-probes）
+
+当手上有多套候选语言配置（支持列表、默认语言、回退链各不相同），想知道
+**「用哪些 Accept-Language 请求做探针，就能把这些配置彼此区分开？」** 时，使用
+配置探针规划接口。请求给出 **2～8 套命名语言配置**（每套的字段与校验规则与
+单人接口完全一致，另加请求内唯一的 `name`）与 **1～20 个候选 Accept-Language
+头**（允许重复；`null`/空白视为无有效范围）。服务端对**每个候选 × 每套配置**
+复用单人协商，只取 `(selected_language, fallback)` 二元组作为该候选在该配置下的
+结果。
+
+- 某候选在两套配置下的二元组**不同**，就说该候选**覆盖（区分）**这对配置——
+  选中语言不同、或仅默认兜底标记不同（如一边走 `locale_fallbacks` 链命中、
+  另一边回退默认语言）都算可区分；
+- 一对配置只要被至少一个候选覆盖就是**可区分配置对**；
+- 服务端对候选子集做**精确穷举**，选出其覆盖对的并集包含全部可区分配置对的
+  **最少候选**；候选数相同时按**候选下标序列字典序**决胜
+  （如 `(0,2)` 胜 `(1,2)`，`(0,1)` 胜 `(0,2)`）；
+- 若没有任何候选能区分任何配置对（所有配置在全部候选头下结果签名完全相同），
+  探针为空列表；
+- 在**全部**候选头下结果签名都相同的配置归入**不可区分组**：给定这些候选头
+  无法用探针区分它们。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/negotiate/config-probes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "configs": [
+      {"name": "base",    "supported_languages": ["en-US", "zh-CN"],          "default_language": "en-US"},
+      {"name": "plus-fr", "supported_languages": ["en-US", "zh-CN", "fr-FR"], "default_language": "en-US"},
+      {"name": "plus-ja", "supported_languages": ["en-US", "zh-CN", "ja-JP"], "default_language": "en-US"}
+    ],
+    "candidates": ["fr", "ja", "en"]
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "probes": [
+    {
+      "candidate_index": 0,
+      "accept_language": "fr",
+      "results": [
+        {"config": "base",    "selected_language": "en-US", "fallback": true},
+        {"config": "plus-fr", "selected_language": "fr-FR", "fallback": false},
+        {"config": "plus-ja", "selected_language": "en-US", "fallback": true}
+      ],
+      "newly_covered_pairs": [
+        {"configs": ["base", "plus-fr"],
+         "results": [
+           {"config": "base",    "selected_language": "en-US", "fallback": true},
+           {"config": "plus-fr", "selected_language": "fr-FR", "fallback": false}]},
+        {"configs": ["plus-fr", "plus-ja"],
+         "results": [
+           {"config": "plus-fr", "selected_language": "fr-FR", "fallback": false},
+           {"config": "plus-ja", "selected_language": "en-US", "fallback": true}]}
+      ]
+    },
+    {
+      "candidate_index": 1,
+      "accept_language": "ja",
+      "results": [
+        {"config": "base",    "selected_language": "en-US", "fallback": true},
+        {"config": "plus-fr", "selected_language": "en-US", "fallback": true},
+        {"config": "plus-ja", "selected_language": "ja-JP", "fallback": false}
+      ],
+      "newly_covered_pairs": [
+        {"configs": ["base", "plus-ja"],
+         "results": [
+           {"config": "base",    "selected_language": "en-US", "fallback": true},
+           {"config": "plus-ja", "selected_language": "ja-JP", "fallback": false}]}
+      ]
+    }
+  ],
+  "total_pair_count": 3,
+  "distinguishable_pair_count": 3,
+  "indistinguishable_groups": [],
+  "message": "穷举 3 个候选 Accept-Language 头后，2 个探针即可区分全部 3 对可区分配置对（共 3 对；同规模按候选下标序列字典序取舍）；另有 0 组配置在所有候选头下结果签名完全相同，无法用给定候选区分"
+}
+```
+
+上例中探针 `fr` 一次区分了 `base/plus-fr` 与 `plus-fr/plus-ja` 两对，探针 `ja`
+补上 `base/plus-ja`，因此 2 个探针即可覆盖全部 3 对；候选 `en` 在三套配置下都
+正常命中 `en-US`，不覆盖任何对，故落选。
+
+### 探针规划请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `configs` | object[] | 是 | 2～8 套命名配置；`name` 非空且请求内不可重复（精确匹配、区分大小写），其余字段与单人接口配置一致 |
+| `candidates` | (string \| null)[] | 是 | 1～20 个候选 `Accept-Language` 头；允许重复，`null`/空白视为无有效范围 |
+
+### 探针规划响应字段
+
+1. **`probes[]`**：入选探针，按候选下标升序排列。每项给出
+   `candidate_index`（候选数组下标，从 0 开始）、`accept_language`（原文）、
+   `results`（该探针在**每一套**配置下的 `selected_language` 与 `fallback`），
+   以及 `newly_covered_pairs`——相对于更早的入选探针，**本探针新增覆盖**的配置对
+   （每对附两套配置各自的结果，便于核对差异）。各探针的新增对两两不交，其并集
+   恰好是全部可区分配置对。
+2. **`total_pair_count` / `distinguishable_pair_count`**：配置对总数
+   （C(n,2)）与其中至少能被一个候选区分的对数。
+3. **`indistinguishable_groups[]`**：在全部候选头下结果签名完全相同的配置组
+   （只含 2 套及以上的组，按首个成员的输入顺序排列）。每组给出 `configs`
+   （组内配置名）与共享的 `signature`：按 `candidates` 下标顺序列出每个候选头
+   及组内配置共同的 `selected_language` / `fallback`。例如三套配置中有两套完全
+   相同：
+
+```json
+{
+  "total_pair_count": 3,
+  "distinguishable_pair_count": 2,
+  "indistinguishable_groups": [
+    {
+      "configs": ["a", "b"],
+      "signature": [
+        {"candidate_index": 0, "accept_language": "fr",
+         "selected_language": "en-US", "fallback": true},
+        {"candidate_index": 1, "accept_language": "de",
+         "selected_language": "en-US", "fallback": true}
+      ]
+    }
+  ]
+}
+```
+
+校验（均返回 **HTTP 422**）：`configs` 少于 2 套或多于 8 套、配置 `name` 重复
+（`loc` 为 `["body","configs"]`）、`candidates` 少于 1 个或多于 20 个；任一候选
+`Accept-Language` 头语法非法时定位到该数组下标，即
+`["body","candidates",1]`（`type` 为
+`accept_language.syntax_error`）；每套配置内部的 `supported_languages`、
+`default_language`、`locale_fallbacks` 校验与单人接口完全一致，错误定位到对应
+配置内（如 `["body","configs",0,"locale_fallbacks"]`）。
+
 ## 协商规则
 
 1. **q 权重**：遵循 RFC 9110，缺省 `q=1`；合法写法为 `0`–`1`、最多 3 位小数
@@ -741,7 +883,7 @@ docker run --rm -p 8000:8000 -e UVICORN_WORKERS=2 language-negotiator
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest -q          # 189 个单元/接口测试
+pytest -q          # 210 个单元/接口测试
 ```
 
 ## 项目结构

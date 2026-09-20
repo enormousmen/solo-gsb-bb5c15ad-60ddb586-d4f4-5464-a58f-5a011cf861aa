@@ -1246,3 +1246,269 @@ def test_change_impact_extra_field_rejected_422():
     payload = _change_impact_payload()
     payload["before"]["unexpected"] = 1
     assert _post_change_impact(payload).status_code == 422
+
+
+def _post_config_probes(payload):
+    return client.post("/api/v1/negotiate/config-probes", json=payload)
+
+
+def _probe_config(name, supported, default="en-US", **extra):
+    config = {
+        "name": name,
+        "supported_languages": supported,
+        "default_language": default,
+    }
+    config.update(extra)
+    return config
+
+
+def test_config_probes_basic():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("base", ["en-US", "zh-CN"]),
+                _probe_config("plus-fr", ["en-US", "zh-CN", "fr-FR"]),
+                _probe_config("plus-ja", ["en-US", "zh-CN", "ja-JP"]),
+            ],
+            "candidates": ["fr", "ja", "en"],
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_pair_count"] == 3
+    assert body["distinguishable_pair_count"] == 3
+    assert body["indistinguishable_groups"] == []
+    assert [p["candidate_index"] for p in body["probes"]] == [0, 1]
+    first = body["probes"][0]
+    assert first["accept_language"] == "fr"
+    assert [r["config"] for r in first["results"]] == [
+        "base",
+        "plus-fr",
+        "plus-ja",
+    ]
+    assert first["results"][0] == {
+        "config": "base",
+        "selected_language": "en-US",
+        "fallback": True,
+    }
+    assert first["results"][1] == {
+        "config": "plus-fr",
+        "selected_language": "fr-FR",
+        "fallback": False,
+    }
+    # Newly covered pairs on the first probe, in canonical pair order.
+    assert [
+        pair["configs"] for pair in first["newly_covered_pairs"]
+    ] == [["base", "plus-fr"], ["plus-fr", "plus-ja"]]
+    assert [
+        pair["configs"] for pair in body["probes"][1]["newly_covered_pairs"]
+    ] == [["base", "plus-ja"]]
+
+
+def test_config_probes_tie_lexicographic_index_sequence():
+    # See the unit-level tie test: combos (0,1) and (1,2) both cover all
+    # pairs; the smaller index sequence wins.
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("a", ["en-US", "fr-FR", "ja-JP"]),
+                _probe_config("b", ["en-US", "fr-FR"]),
+                _probe_config("c", ["en-US", "ja-JP"]),
+            ],
+            "candidates": ["fr", "ja", "fr"],
+        }
+    )
+    assert response.status_code == 200
+    assert [p["candidate_index"] for p in response.json()["probes"]] == [0, 1]
+
+
+def test_config_probes_indistinguishable_group_signature():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("a", ["en-US"]),
+                _probe_config("b", ["en-US"]),
+                _probe_config("c", ["en-US", "fr-FR"]),
+            ],
+            "candidates": ["fr", None],
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_pair_count"] == 3
+    assert body["distinguishable_pair_count"] == 2
+    # One probe ("fr") covers the two pairs touching c.
+    assert [p["candidate_index"] for p in body["probes"]] == [0]
+    assert len(body["indistinguishable_groups"]) == 1
+    group = body["indistinguishable_groups"][0]
+    assert group["configs"] == ["a", "b"]
+    assert group["signature"] == [
+        {
+            "candidate_index": 0,
+            "accept_language": "fr",
+            "selected_language": "en-US",
+            "fallback": True,
+        },
+        {
+            "candidate_index": 1,
+            "accept_language": None,
+            "selected_language": "en-US",
+            "fallback": True,
+        },
+    ]
+
+
+def test_config_probes_none_distinguishable_empty_probes():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("a", ["en-US"]),
+                _probe_config("b", ["en-US"]),
+            ],
+            "candidates": ["de"],
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["probes"] == []
+    assert body["distinguishable_pair_count"] == 0
+    assert [g["configs"] for g in body["indistinguishable_groups"]] == [
+        ["a", "b"]
+    ]
+
+
+def test_config_probes_locale_fallbacks_per_config():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("plain", ["en-US"]),
+                _probe_config(
+                    "chained",
+                    ["en-US"],
+                    locale_fallbacks={"gsw": "en-US"},
+                ),
+            ],
+            "candidates": ["gsw"],
+        }
+    )
+    assert response.status_code == 200
+    pair = response.json()["probes"][0]["newly_covered_pairs"][0]
+    assert pair["results"] == [
+        {"config": "plain", "selected_language": "en-US", "fallback": True},
+        {"config": "chained", "selected_language": "en-US", "fallback": False},
+    ]
+
+
+def test_config_probes_invalid_candidate_header_422_locates_index():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("a", ["en-US"]),
+                _probe_config("b", ["fr-FR"], default="fr-FR"),
+            ],
+            "candidates": ["en", "fr;q=2", "de"],
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "candidates", 1]
+    assert detail[0]["type"] == "accept_language.syntax_error"
+
+
+def test_config_probes_duplicate_config_names_422():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("same", ["en-US"]),
+                _probe_config("same", ["fr-FR"], default="fr-FR"),
+            ],
+            "candidates": ["en"],
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "configs"]
+    assert "重复" in detail[0]["msg"]
+
+
+def test_config_probes_config_count_bounds_422():
+    one = _post_config_probes(
+        {
+            "configs": [_probe_config("a", ["en-US"])],
+            "candidates": ["en"],
+        }
+    )
+    assert one.status_code == 422
+
+    nine = [
+        _probe_config(f"c{i}", ["en-US"]) for i in range(9)
+    ]
+    assert (
+        _post_config_probes({"configs": nine, "candidates": ["en"]}).status_code
+        == 422
+    )
+
+
+def test_config_probes_candidate_count_bounds_422():
+    configs = [
+        _probe_config("a", ["en-US"]),
+        _probe_config("b", ["fr-FR"], default="fr-FR"),
+    ]
+    assert (
+        _post_config_probes({"configs": configs, "candidates": []}).status_code
+        == 422
+    )
+    assert (
+        _post_config_probes(
+            {"configs": configs, "candidates": ["en"] * 21}
+        ).status_code
+        == 422
+    )
+
+
+def test_config_probes_nested_config_validation_422():
+    # default_language not in supported_languages inside configs[1].
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("a", ["en-US"]),
+                _probe_config("b", ["en-US"], default="fr-FR"),
+            ],
+            "candidates": ["en"],
+        }
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][:2] == ["body", "configs"]
+
+    # Dangling locale_fallbacks chain located inside configs[0].
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config(
+                    "a",
+                    ["en-US"],
+                    locale_fallbacks={"de": "xx", "xx": "yy"},
+                ),
+                _probe_config("b", ["en-US"]),
+            ],
+            "candidates": ["de"],
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "configs", 0, "locale_fallbacks"]
+    assert "悬空" in detail[0]["msg"]
+
+
+def test_config_probes_extra_field_rejected_422():
+    response = _post_config_probes(
+        {
+            "configs": [
+                _probe_config("a", ["en-US"]),
+                _probe_config("b", ["en-US"]),
+            ],
+            "candidates": ["en"],
+            "unexpected": 1,
+        }
+    )
+    assert response.status_code == 422

@@ -52,6 +52,15 @@ Implements the negotiation rules required by the service:
   changed, fallback-entered and fallback-exited traffic, plus the
   before->after transition buckets with their weights in
   first-appearance order.
+* :func:`plan_config_probes` also reuses :func:`negotiate`: 2-8 named
+  language configurations and 1-20 candidate Accept-Language headers are
+  each cross-evaluated so every candidate carries a per-configuration
+  (selected_language, fallback) result signature. Two configurations are
+  *distinguishable* only when some candidate yields different results for
+  them; an exact set-cover search picks the fewest candidates that
+  separate every distinguishable pair, ties broken by the lexicographic
+  candidate-index tuple. Configurations left mutually indistinguishable
+  (identical signatures across every candidate) are reported as groups.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
 covers every ordinary language tag (the legacy "grandfathered" irregular
@@ -121,6 +130,21 @@ class SampleHeaderError(AcceptLanguageError):
         self.position = position
         super().__init__(
             f"第 {position} 个样本的 Accept-Language 非法: {detail}"
+        )
+
+
+class ProbeHeaderError(AcceptLanguageError):
+    """A config-probe candidate Accept-Language header failed to parse.
+
+    Carries the 0-based ``index`` of the offending candidate so the API
+    layer can point the 422 response at the exact ``candidates`` array
+    element (FastAPI loc paths use 0-based array indices).
+    """
+
+    def __init__(self, index: int, detail: str):
+        self.index = index
+        super().__init__(
+            f"第 {index + 1} 个候选 Accept-Language 头非法: {detail}"
         )
 
 
@@ -1386,4 +1410,212 @@ def steer_q(
             "new_q": best_step / Q_GRID_STEPS,
         },
         "ranges": None,
+    }
+
+
+# One named language configuration: (name, supported, default, locale_fallbacks).
+ProbeConfigInput = tuple[str, list[str], str, dict[str, str] | None]
+
+
+def plan_config_probes(
+    configs: list[ProbeConfigInput],
+    candidates: list[str | None],
+) -> dict[str, Any]:
+    """Plan the minimal Accept-Language probes that distinguish configurations.
+
+    ``configs`` is a list of 2-8 named language configurations (each a
+    ``(name, supported, default, locale_fallbacks)`` tuple; name
+    uniqueness is enforced by the request schema) and ``candidates`` a
+    list of 1-20 raw candidate Accept-Language headers (``None``/blank
+    means no valid range, exactly as on the single negotiation
+    endpoint; duplicate headers are allowed).
+
+    Every candidate is negotiated against every configuration with the
+    exact semantics of :func:`negotiate`; only the
+    ``(selected_language, fallback)`` pair is used as the per-config
+    result. A candidate *covers* a configuration pair when its results
+    differ for the two configurations -- only differing results can
+    distinguish them. Two configurations are *distinguishable* when at
+    least one candidate covers their pair.
+
+    An exact set-cover search (sizes ascend, ``combinations`` yields
+    index tuples lexicographically) selects the fewest candidates whose
+    covered pairs include every distinguishable pair, so ties fall back
+    to the lexicographically smallest candidate-index sequence. Each
+    chosen probe reports the pairs it adds on top of earlier probes.
+    Configurations whose result signature is identical across *all*
+    candidates are fundamentally indistinguishable and are reported as
+    groups. A malformed candidate header raises
+    :class:`ProbeHeaderError` with the offending candidate's 0-based
+    array index.
+    """
+
+    config_count = len(configs)
+    candidate_count = len(candidates)
+
+    # outcomes[i][j] is candidate i's result signature under config j.
+    outcomes: list[list[dict[str, Any]]] = []
+    for index, header in enumerate(candidates):
+        per_config: list[dict[str, Any]] = []
+        for _name, supported, default, locale_fallbacks in configs:
+            try:
+                result = negotiate(
+                    header=header,
+                    supported=supported,
+                    default=default,
+                    locale_fallbacks=locale_fallbacks,
+                )
+            except AcceptLanguageError as exc:
+                raise ProbeHeaderError(index, str(exc)) from exc
+            per_config.append(
+                {
+                    "selected_language": result["selected_language"],
+                    "fallback": result["fallback"],
+                }
+            )
+        outcomes.append(per_config)
+
+    # One bit per configuration pair, enumerated in a fixed order so that
+    # masks, pair lookups and reported pair lists are all deterministic.
+    pairs: list[tuple[int, int]] = [
+        (a, b)
+        for a in range(config_count)
+        for b in range(a + 1, config_count)
+    ]
+    pair_bits: dict[tuple[int, int], int] = {
+        pair: 1 << pid for pid, pair in enumerate(pairs)
+    }
+    pair_masks: list[int] = []
+    for index in range(candidate_count):
+        mask = 0
+        for pair, bit in pair_bits.items():
+            a, b = pair
+            left = outcomes[index][a]
+            right = outcomes[index][b]
+            if (left["selected_language"], left["fallback"]) != (
+                right["selected_language"],
+                right["fallback"],
+            ):
+                mask |= bit
+        pair_masks.append(mask)
+
+    required = 0
+    for mask in pair_masks:
+        required |= mask
+
+    # Exact search: fewer candidates win, and combinations() emits index
+    # tuples lexicographically, so the first fully-covering tuple is the
+    # contract winner. Inputs are bounded (at most 20 candidates and 8
+    # configs), so an exhaustive search is cheap. When no pair is
+    # distinguishable nothing needs covering, so no probes are chosen.
+    chosen: tuple[int, ...] = ()
+    if required:
+        for size in range(1, candidate_count + 1):
+            for combo in combinations(range(candidate_count), size):
+                covered = 0
+                for index in combo:
+                    covered |= pair_masks[index]
+                if covered & required == required:
+                    chosen = combo
+                    break
+            if chosen:
+                break
+
+    probes: list[dict[str, Any]] = []
+    covered_so_far = 0
+    for index in chosen:
+        new_bits = pair_masks[index] & ~covered_so_far
+        newly_covered = [
+            {
+                "configs": [configs[a][0], configs[b][0]],
+                "results": [
+                    {
+                        "config": configs[c][0],
+                        "selected_language": outcomes[index][c][
+                            "selected_language"
+                        ],
+                        "fallback": outcomes[index][c]["fallback"],
+                    }
+                    for c in (a, b)
+                ],
+            }
+            for (a, b), bit in pair_bits.items()
+            if new_bits & bit
+        ]
+        probes.append(
+            {
+                "candidate_index": index,
+                "accept_language": candidates[index],
+                "results": [
+                    {
+                        "config": config_name,
+                        "selected_language": outcomes[index][config_index][
+                            "selected_language"
+                        ],
+                        "fallback": outcomes[index][config_index]["fallback"],
+                    }
+                    for config_index, (config_name, _s, _d, _f) in enumerate(
+                        configs
+                    )
+                ],
+                "newly_covered_pairs": newly_covered,
+            }
+        )
+        covered_so_far |= pair_masks[index]
+
+    # Group configurations with identical result signatures across every
+    # candidate; groups are emitted by their first member's input order.
+    signature_groups: dict[tuple[tuple[str, bool], ...], list[int]] = {}
+    for config_index in range(config_count):
+        signature = tuple(
+            (
+                outcomes[candidate_index][config_index]["selected_language"],
+                outcomes[candidate_index][config_index]["fallback"],
+            )
+            for candidate_index in range(candidate_count)
+        )
+        signature_groups.setdefault(signature, []).append(config_index)
+    indistinguishable_groups = [
+        {
+            "configs": [configs[index][0] for index in members],
+            "signature": [
+                {
+                    "candidate_index": candidate_index,
+                    "accept_language": candidates[candidate_index],
+                    "selected_language": signature[candidate_index][0],
+                    "fallback": signature[candidate_index][1],
+                }
+                for candidate_index in range(candidate_count)
+            ],
+        }
+        for signature, members in signature_groups.items()
+        if len(members) > 1
+    ]
+
+    total_pair_count = len(pairs)
+    distinguishable_pair_count = required.bit_count()
+    if required == 0:
+        # Every pair is indistinguishable; equal signatures are an
+        # equivalence relation, so all configurations share one group.
+        message = (
+            f"{config_count} 套配置在全部 {candidate_count} 个候选 "
+            "Accept-Language 头下结果签名两两相同，没有任何候选可以区分"
+            "任何配置对：探针为空，这些配置归入同一不可区分组"
+        )
+    else:
+        message = (
+            f"穷举 {candidate_count} 个候选 Accept-Language 头后，"
+            f"{len(chosen)} 个探针即可区分全部 "
+            f"{distinguishable_pair_count} 对可区分配置对"
+            f"（共 {total_pair_count} 对；同规模按候选下标序列字典序取舍）；"
+            f"另有 {len(indistinguishable_groups)} 组配置在所有候选头下"
+            "结果签名完全相同，无法用给定候选区分"
+        )
+
+    return {
+        "probes": probes,
+        "total_pair_count": total_pair_count,
+        "distinguishable_pair_count": distinguishable_pair_count,
+        "indistinguishable_groups": indistinguishable_groups,
+        "message": message,
     }

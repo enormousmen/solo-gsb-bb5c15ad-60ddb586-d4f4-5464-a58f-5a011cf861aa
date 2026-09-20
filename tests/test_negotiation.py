@@ -6,6 +6,7 @@ from app.negotiation import (
     AcceptLanguageError,
     LocaleFallbackError,
     ParticipantHeaderError,
+    ProbeHeaderError,
     SampleHeaderError,
     analyze_q_stability,
     assess_change_impact,
@@ -13,6 +14,7 @@ from app.negotiation import (
     negotiate_group,
     normalize_fallbacks,
     parse_accept_language,
+    plan_config_probes,
     plan_coverage,
     steer_q,
     truncation_chain,
@@ -1331,3 +1333,280 @@ class TestQSteer:
             self.DEFAULT,
             fallbacks,
         )
+
+
+class TestConfigProbes:
+    def _config(self, name, supported, default="en-US", fallbacks=None):
+        return (name, supported, default, fallbacks)
+
+    BASE = ["en-US", "zh-CN"]
+
+    def test_minimal_probes_cover_all_distinguishable_pairs(self):
+        result = plan_config_probes(
+            configs=[
+                self._config("base", self.BASE),
+                self._config("plus-fr", self.BASE + ["fr-FR"]),
+                self._config("plus-ja", self.BASE + ["ja-JP"]),
+            ],
+            candidates=["fr", "ja", "en"],
+        )
+        # fr separates base/plus-fr and plus-fr/plus-ja; ja separates
+        # base/plus-ja: two probes cover all three pairs; en covers none.
+        assert [p["candidate_index"] for p in result["probes"]] == [0, 1]
+        assert result["total_pair_count"] == 3
+        assert result["distinguishable_pair_count"] == 3
+        assert result["indistinguishable_groups"] == []
+        first, second = result["probes"]
+        assert [pair["configs"] for pair in first["newly_covered_pairs"]] == [
+            ["base", "plus-fr"],
+            ["plus-fr", "plus-ja"],
+        ]
+        assert [pair["configs"] for pair in second["newly_covered_pairs"]] == [
+            ["base", "plus-ja"]
+        ]
+        # Newly covered pairs across probes partition the distinguishable set.
+        all_pairs = [
+            tuple(pair["configs"])
+            for probe in result["probes"]
+            for pair in probe["newly_covered_pairs"]
+        ]
+        assert len(all_pairs) == 3
+        assert len(set(all_pairs)) == 3
+
+    def test_per_probe_results_reuse_negotiate_semantics(self):
+        result = plan_config_probes(
+            configs=[
+                self._config("base", ["en-US"]),
+                self._config("plus-fr", ["en-US", "fr-FR"]),
+            ],
+            candidates=["fr;q=0.9,en;q=0.1"],
+        )
+        probe = result["probes"][0]
+        assert probe["results"] == [
+            {"config": "base", "selected_language": "en-US", "fallback": False},
+            {"config": "plus-fr", "selected_language": "fr-FR", "fallback": False},
+        ]
+        # Selected tag differs although neither side falls back.
+        assert probe["newly_covered_pairs"] == [
+            {
+                "configs": ["base", "plus-fr"],
+                "results": [
+                    {
+                        "config": "base",
+                        "selected_language": "en-US",
+                        "fallback": False,
+                    },
+                    {
+                        "config": "plus-fr",
+                        "selected_language": "fr-FR",
+                        "fallback": False,
+                    },
+                ],
+            }
+        ]
+
+    def test_tie_broken_by_lexicographic_index_sequence(self):
+        # Duplicate equivalent headers both uniquely cover the sole pair:
+        # equal size -> the smaller index wins.
+        result = plan_config_probes(
+            configs=[
+                self._config("base", self.BASE),
+                self._config("plus-fr", self.BASE + ["fr-FR"]),
+            ],
+            candidates=["fr", "fr"],
+        )
+        assert [p["candidate_index"] for p in result["probes"]] == [0]
+
+        # Genuine equal-size tie: no single candidate covers all three
+        # pairs, but two different 2-probe combos do. Configs:
+        #   a = en-US, fr-FR, ja-JP ; b = en-US, fr-FR ; c = en-US, ja-JP
+        # Candidate "fr" distinguishes {a-c, b-c}; "ja" distinguishes
+        # {a-b, b-c}; the trailing "fr" copy repeats the first mask. Thus
+        # combos (0,1) and (1,2) both cover all pairs and the
+        # lexicographically smaller index sequence (0,1) must win.
+        configs = [
+            self._config("a", ["en-US", "fr-FR", "ja-JP"]),
+            self._config("b", ["en-US", "fr-FR"]),
+            self._config("c", ["en-US", "ja-JP"]),
+        ]
+        candidates = ["fr", "ja", "fr"]
+        full_masks = [self._full_mask(configs, header) for header in candidates]
+        assert full_masks == [
+            {("a", "c"), ("b", "c")},
+            {("a", "b"), ("b", "c")},
+            {("a", "c"), ("b", "c")},
+        ]
+        # No single candidate covers every pair ...
+        assert not any(mask == self._all_pairs(configs) for mask in full_masks)
+        # ... but both (0,1) and (1,2) do.
+        assert full_masks[0] | full_masks[1] == self._all_pairs(configs)
+        assert full_masks[1] | full_masks[2] == self._all_pairs(configs)
+
+        result = plan_config_probes(configs=configs, candidates=candidates)
+        assert [p["candidate_index"] for p in result["probes"]] == [0, 1]
+        # The chosen probes' newly-covered pairs partition all three pairs.
+        covered = {
+            tuple(pair["configs"])
+            for probe in result["probes"]
+            for pair in probe["newly_covered_pairs"]
+        }
+        assert covered == {("a", "b"), ("a", "c"), ("b", "c")}
+
+    @staticmethod
+    def _full_mask(configs, header):
+        """The set of config-name pairs a header distinguishes directly."""
+
+        outcomes = []
+        for _name, supported, default, fallbacks in configs:
+            outcome = negotiate(
+                header, supported, default, locale_fallbacks=fallbacks
+            )
+            outcomes.append((outcome["selected_language"], outcome["fallback"]))
+        return {
+            (configs[i][0], configs[j][0])
+            for i in range(len(configs))
+            for j in range(i + 1, len(configs))
+            if outcomes[i] != outcomes[j]
+        }
+
+    @staticmethod
+    def _all_pairs(configs):
+        return {
+            (configs[i][0], configs[j][0])
+            for i in range(len(configs))
+            for j in range(i + 1, len(configs))
+        }
+
+    def test_fewer_candidates_win_even_if_later_combo_smaller_indices(self):
+        # Candidate 2 alone covers every pair; pairs involving earlier
+        # indices must not beat the single-probe solution.
+        result = plan_config_probes(
+            configs=[
+                self._config("base", ["en-US"]),
+                self._config("plus-fr", ["en-US", "fr-FR"]),
+                self._config("plus-ja", ["en-US", "ja-JP"]),
+            ],
+            candidates=["fr", "ja", "fr,ja"],
+        )
+        # fr,ja alone: base->en-US fallback, plus-fr->fr-FR (q 1 wins),
+        # plus-ja->ja-JP: it separates all three pairs by itself.
+        assert [p["candidate_index"] for p in result["probes"]] == [2]
+        assert len(result["probes"][0]["newly_covered_pairs"]) == 3
+
+    def test_indistinguishable_configs_form_signature_group(self):
+        result = plan_config_probes(
+            configs=[
+                self._config("a", ["en-US"]),
+                self._config("b", ["en-US"]),
+                self._config("c", ["en-US", "fr-FR"]),
+            ],
+            candidates=["fr", None, "en"],
+        )
+        assert result["total_pair_count"] == 3
+        # a/b are identical under every candidate; c differs on "fr".
+        assert result["distinguishable_pair_count"] == 2
+        assert [p["candidate_index"] for p in result["probes"]] == [0]
+        assert len(result["indistinguishable_groups"]) == 1
+        group = result["indistinguishable_groups"][0]
+        assert group["configs"] == ["a", "b"]
+        assert [entry["candidate_index"] for entry in group["signature"]] == [
+            0,
+            1,
+            2,
+        ]
+        assert [entry["selected_language"] for entry in group["signature"]] == [
+            "en-US",
+            "en-US",
+            "en-US",
+        ]
+        # "fr" and the missing header fall back; "en" is a normal en-US hit.
+        assert [entry["fallback"] for entry in group["signature"]] == [
+            True,
+            True,
+            False,
+        ]
+        assert group["signature"][1]["accept_language"] is None
+
+    def test_no_distinguishable_pair_yields_empty_probes(self):
+        result = plan_config_probes(
+            configs=[
+                self._config("a", ["en-US"]),
+                self._config("b", ["en-US"]),
+            ],
+            candidates=["fr", "de"],
+        )
+        assert result["probes"] == []
+        assert result["distinguishable_pair_count"] == 0
+        assert result["total_pair_count"] == 1
+        assert [g["configs"] for g in result["indistinguishable_groups"]] == [
+            ["a", "b"]
+        ]
+
+    def test_fallback_flag_alone_distinguishes_configs(self):
+        # Both configurations select the same tag en-US, but one reaches
+        # it through a locale_fallbacks chain (fallback=False) while the
+        # other has no matching candidate and uses the default fallback
+        # (fallback=True): only the fallback bit differs, which counts.
+        result = plan_config_probes(
+            configs=[
+                self._config("plain", ["en-US"], fallbacks=None),
+                self._config(
+                    "with-chain",
+                    ["en-US"],
+                    fallbacks={"gsw": "en-US"},
+                ),
+            ],
+            candidates=["gsw"],
+        )
+        assert result["distinguishable_pair_count"] == 1
+        assert result["indistinguishable_groups"] == []
+        pair = result["probes"][0]["newly_covered_pairs"][0]
+        assert pair["results"] == [
+            {"config": "plain", "selected_language": "en-US", "fallback": True},
+            {
+                "config": "with-chain",
+                "selected_language": "en-US",
+                "fallback": False,
+            },
+        ]
+
+    def test_duplicate_candidate_headers_allowed(self):
+        result = plan_config_probes(
+            configs=[
+                self._config("base", self.BASE),
+                self._config("plus-fr", self.BASE + ["fr-FR"]),
+            ],
+            candidates=["fr", "fr"],
+        )
+        assert result["probes"][0]["accept_language"] == "fr"
+        assert result["probes"][0]["candidate_index"] == 0
+        # No indistinguishable group: the pair is distinguishable.
+        assert result["indistinguishable_groups"] == []
+
+    def test_invalid_candidate_header_raises_with_zero_based_index(self):
+        with pytest.raises(ProbeHeaderError) as excinfo:
+            plan_config_probes(
+                configs=[
+                    self._config("base", self.BASE),
+                    self._config("plus-fr", self.BASE + ["fr-FR"]),
+                ],
+                candidates=["en", "fr;q=2"],
+            )
+        exc = excinfo.value
+        assert isinstance(exc, AcceptLanguageError)
+        assert exc.index == 1
+
+    def test_groups_emitted_by_first_member_order(self):
+        result = plan_config_probes(
+            configs=[
+                self._config("a", ["en-US"]),
+                self._config("b", ["en-US", "fr-FR"]),
+                self._config("c", ["en-US"]),
+                self._config("d", ["en-US", "fr-FR"]),
+            ],
+            candidates=["de"],
+        )
+        # "de" falls back everywhere: nothing distinguishes any config.
+        assert [g["configs"] for g in result["indistinguishable_groups"]] == [
+            ["a", "b", "c", "d"]
+        ]
